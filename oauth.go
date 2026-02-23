@@ -282,9 +282,6 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 		if err != nil {
 			if IsInvalidGrant(err) {
 				log.Printf("Cached token is invalid (refresh token revoked or expired), re-authenticating...")
-				if removeErr := os.Remove(string(tokenCache)); removeErr != nil && !os.IsNotExist(removeErr) {
-					log.Printf("Warning: failed to remove token cache: %v", removeErr)
-				}
 			} else {
 				return nil, fmt.Errorf("error refreshing token: %w", err)
 			}

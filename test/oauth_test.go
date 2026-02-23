@@ -90,7 +90,7 @@ func TestCacheFile_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestCacheFile_DeletedOnInvalidGrant(t *testing.T) {
+func TestCacheFile_ReauthOnInvalidGrant(t *testing.T) {
 	tmpDir := t.TempDir()
 	tokenPath := filepath.Join(tmpDir, "request.token")
 
@@ -114,15 +114,13 @@ func TestCacheFile_DeletedOnInvalidGrant(t *testing.T) {
 
 	// Simulate invalid_grant error from token refresh
 	refreshErr := &oauth2.RetrieveError{ErrorCode: "invalid_grant"}
-	if yt.IsInvalidGrant(refreshErr) {
-		if err := os.Remove(tokenPath); err != nil {
-			t.Fatalf("failed to remove token cache: %v", err)
-		}
+	if !yt.IsInvalidGrant(refreshErr) {
+		t.Fatal("expected IsInvalidGrant to return true for invalid_grant error")
 	}
 
-	// Verify file is deleted
-	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
-		t.Error("token cache file should have been deleted after invalid_grant")
+	// Verify file is NOT deleted; PutToken will overwrite it when new token is written
+	if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
+		t.Error("token cache file should NOT be deleted on invalid_grant; re-auth will overwrite it")
 	}
 }
 
