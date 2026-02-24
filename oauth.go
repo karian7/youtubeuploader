@@ -16,10 +16,12 @@ package youtubeuploader
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io/fs"
 	"log"
 	"net"
@@ -61,6 +63,11 @@ var (
 type CallbackStatus struct {
 	code  string
 	state string
+}
+
+// TokenResponseInfo carries token details to the callback handler for display.
+type TokenResponseInfo struct {
+	TokenPath string
 }
 
 // Cache specifies the methods that implement a Token cache.
@@ -154,9 +161,12 @@ func readConfig(scopes []string) (*oauth2.Config, error) {
 	return oCfg, nil
 }
 
+//go:embed oauth_callback.html
+var callbackHTMLTmpl string
+
 // startCallbackWebServer starts a web server that listens on http://localhost:8080.
 // The webserver waits for an oauth code in the three-legged auth flow.
-func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan CallbackStatus, err error) {
+func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan CallbackStatus, tokenInfoCh chan TokenResponseInfo, err error) {
 
 	quitChan := make(chan struct{})
 	defer close(quitChan)
@@ -165,8 +175,10 @@ func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", oAuthPort))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	tokenInfoCh = make(chan TokenResponseInfo, 1)
 
 	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		code := r.FormValue("code")
@@ -176,11 +188,36 @@ func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan
 			cbs.state = r.FormValue("state")
 			cbs.code = r.FormValue("code")
 			callbackCh <- cbs // send code to OAuth flow
-			fmt.Fprintf(w, "Received code: %v\r\nYou can now safely close this browser window.", cbs.code)
+
+			var info TokenResponseInfo
+			select {
+			case info = <-tokenInfoCh:
+			case <-time.After(30 * time.Second):
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				fmt.Fprint(w, `<!DOCTYPE html><html><body><h1>Error</h1><p>Timed out waiting for token information.</p></body></html>`)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				if err := srv.Shutdown(ctx); err != nil {
+					log.Printf("Callback server shutdown error: %s\n", err)
+				}
+				return
+			}
+
+			tmpl, err := template.New("callback").Parse(callbackHTMLTmpl)
+			if err != nil {
+				log.Printf("Failed to parse callback template: %s\n", err)
+			} else {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				if err := tmpl.Execute(w, struct{ TokenPath string }{info.TokenPath}); err != nil {
+					log.Printf("Failed to render callback template: %s\n", err)
+				}
+			}
+
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			err := srv.Shutdown(ctx)
+			err = srv.Shutdown(ctx)
 			if err != nil {
 				log.Printf("Callback server shutdown error: %s\n", err)
 			}
@@ -213,7 +250,7 @@ func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan
 		}
 	}()
 
-	return callbackCh, nil
+	return callbackCh, tokenInfoCh, nil
 }
 
 // cachingTokenSource wraps an oauth2.TokenSource and persists refreshed tokens to a Cache.
@@ -308,7 +345,7 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 	// Start web server.
 	// This is how this program receives the authorization code
 	// when the browser redirects.
-	callbackCh, err := startCallbackWebServer(ctx, oAuthPort)
+	callbackCh, tokenInfoCh, err := startCallbackWebServer(ctx, oAuthPort)
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +377,11 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 	err = tokenCache.PutToken(token)
 	if err != nil {
 		return nil, err
+	}
+
+	// Send token info to the callback handler for HTML rendering
+	tokenInfoCh <- TokenResponseInfo{
+		TokenPath: string(*cache),
 	}
 
 	src := &cachingTokenSource{
