@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/browser"
@@ -214,6 +216,33 @@ func startCallbackWebServer(ctx context.Context, oAuthPort int) (callbackCh chan
 	return callbackCh, nil
 }
 
+// cachingTokenSource wraps an oauth2.TokenSource and persists refreshed tokens to a Cache.
+type cachingTokenSource struct {
+	base      oauth2.TokenSource
+	cache     Cache
+	mu        sync.Mutex
+	lastToken *oauth2.Token
+}
+
+func (s *cachingTokenSource) Token() (*oauth2.Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	token, err := s.base.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	if s.lastToken == nil || s.lastToken.AccessToken != token.AccessToken {
+		if err := s.cache.PutToken(token); err != nil {
+			log.Printf("Warning: failed to cache refreshed token: %v", err)
+		}
+		s.lastToken = token
+	}
+
+	return token, nil
+}
+
 // BuildOAuthHTTPClient takes the user through the three-legged OAuth flow.
 // It opens a browser in the native OS or outputs a URL, then blocks until
 // the redirect completes to the /oauth2callback URI.
@@ -237,8 +266,6 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 		cachePath := filepath.Join(confDir, "youtubeuploader", "request.token")
 		_, err = os.Stat(cachePath)
 		if err == nil {
-			// TODO debug log
-			//logger.Debugf("Reading token from cache file %q\n", cachePath)
 			*cache = cachePath
 		}
 	}
@@ -249,7 +276,29 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 	tokenCache := CacheFile(*cache)
 	token, err := tokenCache.Token()
 	if err == nil {
-		return config.Client(ctx, token), nil
+		// Validate the token by attempting a refresh if it's expired
+		tokenSource := config.TokenSource(ctx, token)
+		newToken, err := tokenSource.Token()
+		if err != nil {
+			if IsInvalidGrant(err) {
+				log.Printf("Cached token is invalid (refresh token revoked or expired), re-authenticating...")
+			} else {
+				return nil, fmt.Errorf("error refreshing token: %w", err)
+			}
+		} else {
+			// Token is valid, save if refreshed and return client
+			if newToken.AccessToken != token.AccessToken {
+				if err := tokenCache.PutToken(newToken); err != nil {
+					log.Printf("Warning: failed to cache refreshed token: %v", err)
+				}
+			}
+			src := &cachingTokenSource{
+				base:      config.TokenSource(ctx, newToken),
+				cache:     tokenCache,
+				lastToken: newToken,
+			}
+			return oauth2.NewClient(ctx, src), nil
+		}
 	}
 
 	// You must always provide a non-zero string and validate that it matches
@@ -293,7 +342,12 @@ func BuildOAuthHTTPClient(ctx context.Context, scopes []string, oAuthPort int) (
 		return nil, err
 	}
 
-	return config.Client(ctx, token), nil
+	src := &cachingTokenSource{
+		base:      config.TokenSource(ctx, token),
+		cache:     tokenCache,
+		lastToken: token,
+	}
+	return oauth2.NewClient(ctx, src), nil
 }
 
 // Token retreives the token from the token cache
@@ -308,6 +362,19 @@ func (f CacheFile) Token() (*oauth2.Token, error) {
 		return nil, fmt.Errorf("CacheFile.Token: %w", err)
 	}
 	return tok, nil
+}
+
+// IsInvalidGrant checks if the error is an OAuth2 "invalid_grant" error,
+// which indicates the refresh token has been revoked or expired.
+func IsInvalidGrant(err error) bool {
+	if err == nil {
+		return false
+	}
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) {
+		return retrieveErr.ErrorCode == "invalid_grant"
+	}
+	return strings.Contains(err.Error(), "invalid_grant")
 }
 
 // PutToken stores the token in the token cache
